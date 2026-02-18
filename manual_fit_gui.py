@@ -25,15 +25,12 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QComboBox,
     QTextEdit,
-    QPlainTextEdit,
-    QTabWidget,
     QCheckBox,
     QFileDialog,
     QLineEdit,
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot, QDateTime
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
@@ -660,7 +657,7 @@ class ManualFitGUI(QMainWindow):
     def save_params(self):
         """Save current parameters as new defaults."""
         self.defaults = self.get_current_params()
-        self.stats_text.append(f"\nParameters saved as defaults!")
+        self.stats_text.append("\nParameters saved as defaults!")
 
     def export_fit(self):
         """Export fitted parameters to a text file."""

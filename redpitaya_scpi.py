@@ -4,7 +4,7 @@ Provides SCPI access to Red Pitaya from host computer.
 
 import socket
 from enum import Enum
-from typing import List, Optional, Union
+from typing import List, Optional
 import numpy as np
 
 __author__ = "Luka Golinar, Iztok Jeras, Miha Gjura"
