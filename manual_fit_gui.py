@@ -36,6 +36,11 @@ from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
 
+# use Qt5Agg backend for better performance
+from matplotlib.pyplot import switch_backend
+
+switch_backend("Qt5Agg")
+
 
 def mi_model(x, a, b, phi, d):
     """MI model: Voltage = |A*sin(B*Sig gen Output + phi_0) + D|^2"""
@@ -103,7 +108,7 @@ class ManualFitGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Manual MI Model Curve Fitting")
-        self.setGeometry(100, 100, 1400, 900)
+        self.setGeometry(100, 100, 600, 700)
 
         self.data_files = []
         self.current_file_idx = 0
@@ -152,15 +157,12 @@ class ManualFitGUI(QMainWindow):
         self.create_stats_frame(params_stats_layout)
         main_layout.addLayout(params_stats_layout)
 
-        # Control buttons
-        self.create_controls_frame(main_layout)
-
         # Load files
         self.load_files()
 
     def create_file_frame(self, parent_layout):
         """Create compact file selection section."""
-        group = QGroupBox("File Selection")
+        group = QGroupBox("")
         layout = QVBoxLayout()
 
         # Directory row
@@ -208,12 +210,13 @@ class ManualFitGUI(QMainWindow):
 
     def create_plot_frame(self, parent_layout):
         """Create plot section."""
-        group = QGroupBox("Data and Fit")
+        group = QGroupBox("")
         layout = QVBoxLayout()
 
         self.fig = Figure(figsize=(10, 5), dpi=100)
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvas(self.fig)
+        self.fig.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.16)
 
         # Add matplotlib navigation toolbar
         self.toolbar = NavigationToolbar(self.canvas, self)
@@ -225,8 +228,22 @@ class ManualFitGUI(QMainWindow):
 
     def create_parameters_frame(self, parent_layout):
         """Create compact parameter controls section."""
-        group = QGroupBox("Parameters: |A·sin(B·x + φ) + D|²")
+        group = QGroupBox("")
         layout = QVBoxLayout()
+
+        header_layout = QHBoxLayout()
+        header_layout.addWidget(QLabel("|A·sin(B·x + φ) + D|²"))
+        header_layout.addStretch()
+        self.show_residuals_cb = QCheckBox("Show Residuals")
+        self.show_residuals_cb.setChecked(True)
+        self.show_residuals_cb.stateChanged.connect(
+            lambda: self.update_plot(fast=False)
+        )
+        header_layout.addWidget(self.show_residuals_cb)
+        reset_btn = QPushButton("Reset to Defaults")
+        reset_btn.clicked.connect(self.reset_params)
+        header_layout.addWidget(reset_btn)
+        layout.addLayout(header_layout)
 
         # Parameter A (MI Amplitude)
         a_layout = self.create_param_control(
@@ -339,30 +356,9 @@ class ManualFitGUI(QMainWindow):
 
         return (layout, spinbox, slider)
 
-    def create_controls_frame(self, parent_layout):
-        """Create control buttons section."""
-        group = QGroupBox("Controls")
-        layout = QHBoxLayout()
-
-        reset_btn = QPushButton("Reset to Defaults")
-        reset_btn.clicked.connect(self.reset_params)
-        layout.addWidget(reset_btn)
-
-        self.show_residuals_cb = QCheckBox("Show Residuals")
-        self.show_residuals_cb.setChecked(True)
-        self.show_residuals_cb.stateChanged.connect(
-            lambda: self.update_plot(fast=False)
-        )
-        layout.addWidget(self.show_residuals_cb)
-
-        layout.addStretch()
-
-        group.setLayout(layout)
-        parent_layout.addWidget(group)
-
     def create_stats_frame(self, parent_layout):
         """Create statistics display section with auto-fit controls."""
-        group = QGroupBox("Auto-Fit")
+        group = QGroupBox("")
         layout = QVBoxLayout()
 
         # Auto-fit control buttons
@@ -615,17 +611,33 @@ class ManualFitGUI(QMainWindow):
                 # Fast update: only update line data
                 if "fitted" in self._plot_lines:
                     self._plot_lines["fitted"].set_ydata(fitted_ch2)
+                y_min = float(np.min(fitted_ch2))
+                y_max = float(np.max(fitted_ch2))
+                y_min = min(y_min, float(np.min(ch2_data)), float(np.min(ch3_data)))
+                y_max = max(y_max, float(np.max(ch2_data)), float(np.max(ch3_data)))
                 if (
                     "residuals" in self._plot_lines
                     and self.show_residuals_cb.isChecked()
                 ):
                     residuals = ch2_data - fitted_ch2
+                    self._plot_lines["residuals"].set_visible(True)
                     self._plot_lines["residuals"].set_ydata(residuals)
+                    res_min = float(np.min(residuals))
+                    res_max = float(np.max(residuals))
+                    y_min = min(y_min, res_min)
+                    y_max = max(y_max, res_max)
                 elif (
                     "residuals" in self._plot_lines
                     and not self.show_residuals_cb.isChecked()
                 ):
                     self._plot_lines["residuals"].set_visible(False)
+                pad = (y_max - y_min) * 0.05
+                if pad == 0.0:
+                    pad = 1.0
+                self.ax.set_ylim(y_min - pad, y_max + pad)
+                self.ax.set_xlim(time_data[0], time_data[-1])
+                self.canvas.draw_idle()
+                return
             else:
                 # Full update: redraw everything
                 self.ax.plot(
@@ -644,7 +656,6 @@ class ManualFitGUI(QMainWindow):
                     fitted_ch2,
                     label="Fitted CH2",
                     linewidth=2,
-                    linestyle="--",
                 )
                 self._plot_lines["fitted"] = fitted_line
 
@@ -667,35 +678,12 @@ class ManualFitGUI(QMainWindow):
             else:
                 r2 = getattr(self, "_last_r2", 0.0)
 
-            # Add parameter text to plot
-            param_names = [
-                "A (MI Amplitude)",
-                "B (V→Phase)",
-                "φ (MI Phase)",
-                "D (MI Offset)",
-            ]
-            param_text = "\n".join(
-                [f"{name}: {value:.4f}" for name, value in zip(param_names, params)]
-            )
-            param_text += f"\nR² Score: {r2:.4f}"
-
-            self.ax.text(
-                0.02,
-                0.98,
-                param_text,
-                transform=self.ax.transAxes,
-                fontsize=9,
-                verticalalignment="top",
-                bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
-            )
-
-            self.ax.legend(loc="upper right")
+            self.ax.legend(loc="lower right")
             self.ax.set_xlabel("Time (ms)")
             self.ax.set_ylabel("Voltage (V)")
-            self.ax.set_title(Path(self.data_files[self.current_file_idx]).name)
+            self.ax.set_xlim(time_data[0], time_data[-1])
             self.ax.grid(True, alpha=0.3)
 
-            self.fig.tight_layout()
             self.canvas.draw()
 
             # Update stats text
