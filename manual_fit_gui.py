@@ -29,7 +29,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QLineEdit,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -103,7 +103,7 @@ class ManualFitGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Manual MI Model Curve Fitting")
-        self.setGeometry(100, 100, 1200, 900)
+        self.setGeometry(100, 100, 1400, 900)
 
         self.data_files = []
         self.current_file_idx = 0
@@ -119,6 +119,17 @@ class ManualFitGUI(QMainWindow):
         self.defaults = [0.74545, -0.2175, 0.5263, 1.7019]
         self.bounds = ([0, -2, -2 * np.pi, -10], [100, 2, 2 * np.pi, 10])
 
+        # Optimization: timer for debouncing updates
+        self.update_timer = QTimer()
+        self.update_timer.setSingleShot(True)
+        self.update_timer.timeout.connect(self.do_full_update)
+        self.slider_active = False
+
+        # Cache for plot data
+        self.cached_time_data = None
+        self.cached_ch2_data = None
+        self.cached_ch3_data = None
+
         # Current directory
         self.current_dir = "./measurements_18-02-26/shaking_functions/"
 
@@ -127,63 +138,70 @@ class ManualFitGUI(QMainWindow):
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(10)
+        main_layout.setSpacing(5)
 
-        # File selection
+        # File selection (compact)
         self.create_file_frame(main_layout)
 
         # Plot frame
         self.create_plot_frame(main_layout)
 
-        # Parameters frame
-        self.create_parameters_frame(main_layout)
+        # Parameters and Stats side by side
+        params_stats_layout = QHBoxLayout()
+        self.create_parameters_frame(params_stats_layout)
+        self.create_stats_frame(params_stats_layout)
+        main_layout.addLayout(params_stats_layout)
 
         # Control buttons
         self.create_controls_frame(main_layout)
-
-        # Stats frame
-        self.create_stats_frame(main_layout)
 
         # Load files
         self.load_files()
 
     def create_file_frame(self, parent_layout):
-        """Create file selection section."""
+        """Create compact file selection section."""
         group = QGroupBox("File Selection")
         layout = QVBoxLayout()
 
-        # Directory selection
+        # Directory row
         dir_layout = QHBoxLayout()
-        dir_layout.addWidget(QLabel("Directory:"))
-        self.dir_input = QLineEdit(self.current_dir)
-        self.dir_input.setReadOnly(True)
-        dir_layout.addWidget(self.dir_input)
-
-        browse_dir_btn = QPushButton("Browse Directory")
+        browse_dir_btn = QPushButton("📁")
+        browse_dir_btn.setMaximumWidth(40)
+        browse_dir_btn.setToolTip("Browse Directory")
         browse_dir_btn.clicked.connect(self.browse_directory)
         dir_layout.addWidget(browse_dir_btn)
-        layout.addLayout(dir_layout)
 
-        # File selection
-        file_layout = QHBoxLayout()
-        file_layout.addWidget(QLabel("Select File:"))
+        self.dir_input = QLineEdit(self.current_dir)
+        self.dir_input.setReadOnly(True)
+        self.dir_input.setStyleSheet("QLineEdit { background-color: #f0f0f0; }")
+        dir_layout.addWidget(self.dir_input)
+
+        # File row
         self.file_combo = QComboBox()
         self.file_combo.currentIndexChanged.connect(self.on_file_changed)
-        file_layout.addWidget(self.file_combo)
+        dir_layout.addWidget(self.file_combo)
 
-        browse_file_btn = QPushButton("Browse File")
+        # Browse file button
+        browse_file_btn = QPushButton("📄")
+        browse_file_btn.setMaximumWidth(40)
+        browse_file_btn.setToolTip("Browse File")
         browse_file_btn.clicked.connect(self.browse_file)
-        file_layout.addWidget(browse_file_btn)
+        dir_layout.addWidget(browse_file_btn)
 
-        prev_btn = QPushButton("← Previous")
+        # Navigation buttons
+        prev_btn = QPushButton("◀")
+        prev_btn.setMaximumWidth(40)
+        prev_btn.setToolTip("Previous File")
         prev_btn.clicked.connect(self.prev_file)
-        file_layout.addWidget(prev_btn)
+        dir_layout.addWidget(prev_btn)
 
-        next_btn = QPushButton("Next →")
+        next_btn = QPushButton("▶")
+        next_btn.setMaximumWidth(40)
+        next_btn.setToolTip("Next File")
         next_btn.clicked.connect(self.next_file)
-        file_layout.addWidget(next_btn)
+        dir_layout.addWidget(next_btn)
 
-        layout.addLayout(file_layout)
+        layout.addLayout(dir_layout)
 
         group.setLayout(layout)
         parent_layout.addWidget(group)
@@ -206,13 +224,13 @@ class ManualFitGUI(QMainWindow):
         parent_layout.addWidget(group)
 
     def create_parameters_frame(self, parent_layout):
-        """Create parameter controls section."""
-        group = QGroupBox("MI Model Parameters: |A*sin(B*x + φ) + D|²")
+        """Create compact parameter controls section."""
+        group = QGroupBox("Parameters: |A·sin(B·x + φ) + D|²")
         layout = QVBoxLayout()
 
         # Parameter A (MI Amplitude)
         a_layout = self.create_param_control(
-            "A (MI Amplitude):",
+            "A:",
             0.0,
             10.0,
             self.defaults[0],
@@ -225,7 +243,7 @@ class ManualFitGUI(QMainWindow):
 
         # Parameter B (Voltage to Freq to Phase)
         b_layout = self.create_param_control(
-            "B (Voltage to Phase):",
+            "B:",
             -2.0,
             2.0,
             self.defaults[1],
@@ -238,7 +256,7 @@ class ManualFitGUI(QMainWindow):
 
         # Parameter phi (MI Phase)
         phi_layout = self.create_param_control(
-            "φ (MI Phase):",
+            "φ:",
             -2 * np.pi,
             2 * np.pi,
             self.defaults[2],
@@ -251,7 +269,7 @@ class ManualFitGUI(QMainWindow):
 
         # Parameter D (MI Offset)
         d_layout = self.create_param_control(
-            "D (MI Offset):",
+            "D:",
             -10.0,
             10.0,
             self.defaults[3],
@@ -268,11 +286,12 @@ class ManualFitGUI(QMainWindow):
     def create_param_control(
         self, label_text, min_val, max_val, default_val, step, slider_range
     ):
-        """Helper to create parameter control with spinbox and slider."""
+        """Helper to create compact parameter control with spinbox and slider."""
         layout = QHBoxLayout()
 
         label = QLabel(label_text)
-        label.setMinimumWidth(200)
+        label.setMinimumWidth(30)
+        label.setMaximumWidth(30)
         layout.addWidget(label)
 
         # Spinbox
@@ -282,8 +301,9 @@ class ManualFitGUI(QMainWindow):
         spinbox.setValue(default_val)
         spinbox.setSingleStep(step)
         spinbox.setDecimals(4)
-        spinbox.setMinimumWidth(100)
-        spinbox.valueChanged.connect(self.update_plot)
+        spinbox.setMinimumWidth(90)
+        spinbox.setMaximumWidth(90)
+        spinbox.valueChanged.connect(lambda: self.update_plot(fast=False))
         layout.addWidget(spinbox)
 
         # Slider
@@ -297,15 +317,24 @@ class ManualFitGUI(QMainWindow):
             spinbox.blockSignals(True)
             spinbox.setValue(value / 1000)
             spinbox.blockSignals(False)
-            self.update_plot()
+            self.update_plot(fast=True)
 
         def spinbox_to_slider(value):
             slider.blockSignals(True)
             slider.setValue(int(value * 1000))
             slider.blockSignals(False)
 
+        def slider_pressed():
+            self.slider_active = True
+
+        def slider_released():
+            self.slider_active = False
+            self.do_full_update()
+
         slider.valueChanged.connect(slider_to_spinbox)
         spinbox.valueChanged.connect(spinbox_to_slider)
+        slider.sliderPressed.connect(slider_pressed)
+        slider.sliderReleased.connect(slider_released)
         layout.addWidget(slider)
 
         return (layout, spinbox, slider)
@@ -315,37 +344,16 @@ class ManualFitGUI(QMainWindow):
         group = QGroupBox("Controls")
         layout = QHBoxLayout()
 
-        self.auto_fit_btn = QPushButton("🔄 Auto Fit")
-        self.auto_fit_btn.setStyleSheet(
-            "font-weight: bold; background-color: #4CAF50; color: white;"
-        )
-        self.auto_fit_btn.clicked.connect(self.auto_fit)
-        layout.addWidget(self.auto_fit_btn)
-
-        self.cancel_fit_btn = QPushButton("Cancel Fit")
-        self.cancel_fit_btn.setStyleSheet(
-            "font-weight: bold; background-color: #d32f2f; color: white;"
-        )
-        self.cancel_fit_btn.setEnabled(False)
-        self.cancel_fit_btn.clicked.connect(self.cancel_auto_fit)
-        layout.addWidget(self.cancel_fit_btn)
-
         reset_btn = QPushButton("Reset to Defaults")
         reset_btn.clicked.connect(self.reset_params)
         layout.addWidget(reset_btn)
 
         self.show_residuals_cb = QCheckBox("Show Residuals")
         self.show_residuals_cb.setChecked(True)
-        self.show_residuals_cb.stateChanged.connect(self.update_plot)
+        self.show_residuals_cb.stateChanged.connect(
+            lambda: self.update_plot(fast=False)
+        )
         layout.addWidget(self.show_residuals_cb)
-
-        save_btn = QPushButton("Save Parameters")
-        save_btn.clicked.connect(self.save_params)
-        layout.addWidget(save_btn)
-
-        export_btn = QPushButton("Export Fit")
-        export_btn.clicked.connect(self.export_fit)
-        layout.addWidget(export_btn)
 
         layout.addStretch()
 
@@ -353,13 +361,41 @@ class ManualFitGUI(QMainWindow):
         parent_layout.addWidget(group)
 
     def create_stats_frame(self, parent_layout):
-        """Create statistics display section."""
-        group = QGroupBox("Fit Statistics")
+        """Create statistics display section with auto-fit controls."""
+        group = QGroupBox("Auto-Fit")
         layout = QVBoxLayout()
 
+        # Auto-fit control buttons
+        btn_layout = QHBoxLayout()
+
+        self.auto_fit_btn = QPushButton("🔄 Auto Fit")
+        self.auto_fit_btn.setStyleSheet(
+            "font-weight: bold; background-color: #4CAF50; color: white;"
+        )
+        self.auto_fit_btn.clicked.connect(self.auto_fit)
+        btn_layout.addWidget(self.auto_fit_btn)
+
+        # Progress status label
+        self.fit_status_label = QLabel("")
+        self.fit_status_label.setStyleSheet(
+            "font-weight: bold; color: #FF9800; padding: 5px;"
+        )
+        self.fit_status_label.hide()
+        btn_layout.addWidget(self.fit_status_label)
+
+        save_btn = QPushButton("Save Params")
+        save_btn.clicked.connect(self.save_params)
+        btn_layout.addWidget(save_btn)
+
+        export_btn = QPushButton("Export Fit")
+        export_btn.clicked.connect(self.export_fit)
+        btn_layout.addWidget(export_btn)
+
+        layout.addLayout(btn_layout)
+
+        # Stats text display
         self.stats_text = QTextEdit()
         self.stats_text.setReadOnly(True)
-        self.stats_text.setMaximumHeight(100)
         layout.addWidget(self.stats_text)
 
         group.setLayout(layout)
@@ -397,7 +433,11 @@ class ManualFitGUI(QMainWindow):
         try:
             file_path = self.data_files[idx]
             self.current_data = read_csv(file_path, skiprows=13, header=0)
-            self.update_plot()
+            # Cache data for faster updates
+            self.cached_time_data = self.current_data["TIME"].to_numpy() * 1e3
+            self.cached_ch2_data = self.current_data["CH2"].to_numpy()
+            self.cached_ch3_data = self.current_data["CH3"].to_numpy()
+            self.update_plot(fast=False)
         except Exception as e:
             self.stats_text.setText(f"Error loading file: {e}")
 
@@ -432,6 +472,10 @@ class ManualFitGUI(QMainWindow):
         self.phi_spinbox.setValue(self.defaults[2])
         self.d_spinbox.setValue(self.defaults[3])
 
+    def do_full_update(self):
+        """Perform a complete update including stats."""
+        self.update_plot(fast=False)
+
     def browse_directory(self):
         """Browse for a directory containing CSV files."""
         dir_path = QFileDialog.getExistingDirectory(
@@ -441,7 +485,6 @@ class ManualFitGUI(QMainWindow):
             self.current_dir = dir_path + "/"
             self.dir_input.setText(self.current_dir)
             self.load_files()
-            self.stats_text.append(f"Loaded directory: {self.current_dir}")
 
     def browse_file(self):
         """Browse for a single CSV file."""
@@ -460,7 +503,6 @@ class ManualFitGUI(QMainWindow):
             # Select this file
             idx = self.data_files.index(file_path)
             self.load_file(idx)
-            self.stats_text.append(f"Loaded file: {Path(file_path).name}")
 
     def auto_fit(self):
         """Start auto-fit in a worker thread to keep GUI responsive."""
@@ -487,17 +529,10 @@ class ManualFitGUI(QMainWindow):
         self.fit_worker.cancelled.connect(self.on_fit_cancelled)
 
         self.auto_fit_btn.setEnabled(False)
-        self.cancel_fit_btn.setEnabled(True)
+        self.fit_status_label.setText("⏳ Auto-fit in progress...")
+        self.fit_status_label.show()
         self.stats_text.append("\nAuto-fit started...")
         self.fit_thread.start()
-
-    def cancel_auto_fit(self):
-        """Request cancellation of the running auto-fit."""
-        if self.fit_worker is None:
-            return
-        self.fit_worker.request_cancel()
-        self.cancel_fit_btn.setEnabled(False)
-        self.stats_text.append("Cancelling auto-fit...")
 
     def on_fit_finished(self, popt, pcov, r2):
         """Handle successful fit completion."""
@@ -542,55 +577,95 @@ class ManualFitGUI(QMainWindow):
         self.fit_thread = None
         self.fit_worker = None
         self.auto_fit_btn.setEnabled(True)
-        self.cancel_fit_btn.setEnabled(False)
+        self.fit_status_label.hide()
 
-    def update_plot(self):
-        """Update plot with current parameters."""
+    def update_plot(self, fast=False):
+        """Update plot with current parameters.
+
+        Args:
+            fast: If True, skip expensive operations for smooth slider interaction
+        """
         if self.current_data is None:
             return
 
+        # Debounce full updates during slider movement
+        if fast and not self.slider_active:
+            # Use timer to batch rapid updates
+            self.update_timer.stop()
+            self.update_timer.start(50)  # 50ms debounce
+            return
+
         try:
-            data = self.current_data
             params = self.get_current_params()
 
-            # Clear plot
-            self.ax.clear()
+            # Use cached data for faster computation
+            time_data = self.cached_time_data
+            ch2_data = self.cached_ch2_data
+            ch3_data = self.cached_ch3_data
 
-            # Plot original data
-            self.ax.plot(
-                data["TIME"] * 1e3, data["CH2"], label=self.channels["CH2"], linewidth=2
-            )
-            self.ax.plot(
-                data["TIME"] * 1e3,
-                data["CH3"],
-                label=self.channels["CH3"],
-                color="gray",
-                alpha=0.5,
-            )
+            # Clear plot only when necessary
+            if not fast or not hasattr(self, "_plot_lines"):
+                self.ax.clear()
+                self._plot_lines = {}
 
-            # Plot fitted curve
-            fitted_ch2 = mi_model(data["CH3"], *params)
-            self.ax.plot(
-                data["TIME"] * 1e3,
-                fitted_ch2,
-                label="Fitted CH2",
-                linewidth=2,
-                linestyle="--",
-            )
+            # Calculate fitted curve
+            fitted_ch2 = mi_model(ch3_data, *params)
 
-            # Show residuals if enabled
-            if self.show_residuals_cb.isChecked():
-                residuals = data["CH2"] - fitted_ch2
+            if fast and hasattr(self, "_plot_lines"):
+                # Fast update: only update line data
+                if "fitted" in self._plot_lines:
+                    self._plot_lines["fitted"].set_ydata(fitted_ch2)
+                if (
+                    "residuals" in self._plot_lines
+                    and self.show_residuals_cb.isChecked()
+                ):
+                    residuals = ch2_data - fitted_ch2
+                    self._plot_lines["residuals"].set_ydata(residuals)
+                elif (
+                    "residuals" in self._plot_lines
+                    and not self.show_residuals_cb.isChecked()
+                ):
+                    self._plot_lines["residuals"].set_visible(False)
+            else:
+                # Full update: redraw everything
                 self.ax.plot(
-                    data["TIME"] * 1e3,
-                    residuals,
-                    label="Residuals",
-                    linestyle=":",
-                    linewidth=1.5,
+                    time_data, ch2_data, label=self.channels["CH2"], linewidth=2
+                )
+                self.ax.plot(
+                    time_data,
+                    ch3_data,
+                    label=self.channels["CH3"],
+                    color="gray",
+                    alpha=0.5,
                 )
 
-            # Calculate R² score
-            r2 = r2_score(data["CH2"], fitted_ch2)
+                (fitted_line,) = self.ax.plot(
+                    time_data,
+                    fitted_ch2,
+                    label="Fitted CH2",
+                    linewidth=2,
+                    linestyle="--",
+                )
+                self._plot_lines["fitted"] = fitted_line
+
+                # Show residuals if enabled
+                if self.show_residuals_cb.isChecked():
+                    residuals = ch2_data - fitted_ch2
+                    (residuals_line,) = self.ax.plot(
+                        time_data,
+                        residuals,
+                        label="Residuals",
+                        linestyle=":",
+                        linewidth=1.5,
+                    )
+                    self._plot_lines["residuals"] = residuals_line
+
+            # Calculate R² score (skip during fast updates for smoothness)
+            if not fast:
+                r2 = r2_score(ch2_data, fitted_ch2)
+                self._last_r2 = r2
+            else:
+                r2 = getattr(self, "_last_r2", 0.0)
 
             # Add parameter text to plot
             param_names = [
@@ -624,40 +699,27 @@ class ManualFitGUI(QMainWindow):
             self.canvas.draw()
 
             # Update stats text
-            stats = f"R² Score: {r2:.6f}\n"
-            stats += f"A (MI Amplitude): {params[0]:.6f}\n"
-            stats += f"B (Voltage to Phase): {params[1]:.6f}\n"
-            stats += f"φ (MI Phase): {params[2]:.6f}\n"
-            stats += f"D (MI Offset): {params[3]:.6f}"
-
             if self.last_popt is not None and self.last_pcov is not None:
-                popt_text = np.array2string(
-                    self.last_popt, precision=6, floatmode="fixed", suppress_small=False
-                )
-                pcov_text = np.array2string(
-                    self.last_pcov, precision=6, floatmode="fixed", suppress_small=False
-                )
                 sigma = np.sqrt(np.maximum(np.diag(self.last_pcov), 0.0))
-                sigma_text = np.array2string(
-                    sigma, precision=6, floatmode="fixed", suppress_small=False
-                )
                 fit_r2_text = (
                     f"{self.last_fit_r2:.6f}" if self.last_fit_r2 is not None else "N/A"
                 )
-                stats += "\n\nLast Auto-Fit:"
-                stats += f"\nR²: {fit_r2_text}"
-                stats += f"\npopt: {popt_text}"
-                stats += f"\n1σ (sqrt(diag(pcov))): {sigma_text}"
-                stats += f"\npcov:\n{pcov_text}"
-            self.stats_text.setText(stats)
-
+                stats = f"R² = {fit_r2_text}\n\n"
+                stats += f"A = {self.last_popt[0]:.6f} ± {sigma[0]:.6f}\n"
+                stats += f"B = {self.last_popt[1]:.6f} ± {sigma[1]:.6f}\n"
+                stats += f"φ = {self.last_popt[2]:.6f} ± {sigma[2]:.6f}\n"
+                stats += f"D = {self.last_popt[3]:.6f} ± {sigma[3]:.6f}"
+                self.stats_text.setText(stats)
+            else:
+                self.stats_text.setText(
+                    "No auto-fit results yet.\n\nClick 'Auto Fit' to optimize parameters."
+                )
         except Exception as e:
-            self.stats_text.setText(f"Error updating plot: {e}")
+            self.stats_text.setText(f"Error updating stats: {e}")
 
     def save_params(self):
         """Save current parameters as new defaults."""
         self.defaults = self.get_current_params()
-        self.stats_text.append("\nParameters saved as defaults!")
 
     def export_fit(self):
         """Export fitted parameters to a text file."""
@@ -679,10 +741,8 @@ class ManualFitGUI(QMainWindow):
                     r2 = r2_score(self.current_data["CH2"], fitted_ch2)
                     f.write(f"R² Score: {r2:.6f}\n")
 
-            self.stats_text.append(f"Parameters exported to {filename}")
-
-        except Exception as e:
-            self.stats_text.append(f"Error exporting: {e}")
+        except Exception:
+            pass  # Silent fail
 
     def closeEvent(self, event):
         """Ensure worker thread is stopped before closing."""
