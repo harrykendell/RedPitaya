@@ -265,6 +265,50 @@ def extract_captures(
     return {"match": match.group(0)}
 
 
+def render_batch_thumbnail(row, model_func, full_thumbnail_size=(468, 312)):
+    """Render a row thumbnail pixmap, including fitted curve when available."""
+    try:
+        data = read_csv(row["file"], skiprows=13, header=0)
+        time_data = data["TIME"].to_numpy() * 1e3
+        ch2_data = data["CH2"].to_numpy()
+        ch3_data = data["CH3"].to_numpy()
+
+        target_width = max(24, int(full_thumbnail_size[0]))
+        target_height = max(24, int(full_thumbnail_size[1]))
+        render_dpi = 180
+        fig = Figure(
+            figsize=(target_width / render_dpi, target_height / render_dpi),
+            dpi=render_dpi,
+        )
+        fig.subplots_adjust(left=0.08, right=0.98, top=0.92, bottom=0.16)
+        ax = fig.add_subplot(111)
+        ax.plot(time_data, ch2_data, linewidth=1.25, color="C0")
+        ax.plot(time_data, ch3_data, linewidth=1.25, alpha=0.45, color="C1")
+
+        params = row.get("params")
+        if params:
+            fitted_ch2 = model_func(ch3_data, *params)
+            ax.plot(time_data, fitted_ch2, linewidth=1.25, color="C2")
+
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.grid(True, alpha=0.15)
+
+        buf = BytesIO()
+        fig.savefig(buf, format="png", dpi=render_dpi)
+        buf.seek(0)
+        data_bytes = buf.getvalue()
+        buf.close()
+
+        pixmap = QPixmap()
+        pixmap.loadFromData(data_bytes, "PNG")
+        return pixmap
+    except Exception:
+        pixmap = QPixmap(full_thumbnail_size[0], full_thumbnail_size[1])
+        pixmap.fill(Qt.GlobalColor.white)
+        return pixmap
+
+
 class FitWorker(QObject):
     finished = pyqtSignal(object, object, float)
     failed = pyqtSignal(str)
@@ -329,13 +373,22 @@ class BatchFitWorker(QObject):
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(self, file_paths, p0, bounds, regex_pattern, model_func):
+    def __init__(
+        self,
+        file_paths,
+        p0,
+        bounds,
+        regex_pattern,
+        model_func,
+        full_thumbnail_size=(468, 312),
+    ):
         super().__init__()
         self.file_paths = list(file_paths)
         self.p0 = np.asarray(p0, dtype=float)
         self.bounds = bounds
         self.regex = re.compile(regex_pattern) if regex_pattern else None
         self.model_func = model_func
+        self.full_thumbnail_size = full_thumbnail_size
         self.cancel_requested = False
 
     def request_cancel(self):
@@ -383,6 +436,13 @@ class BatchFitWorker(QObject):
                     row["r2"] = float(r2_score(y_data, fitted))
                 except Exception as exc:
                     row["error"] = str(exc)
+
+                # Build/update thumbnail immediately so the table updates per-file.
+                row["plot_full"] = render_batch_thumbnail(
+                    row,
+                    self.model_func,
+                    full_thumbnail_size=self.full_thumbnail_size,
+                )
 
                 results.append(row)
                 self.progress.emit(idx + 1, total, row)
@@ -437,47 +497,11 @@ class ThumbnailRenderWorker(QObject):
 
     def render_thumbnail(self, row):
         """Render a plot to a QPixmap for embedding in table."""
-        try:
-            data = read_csv(row["file"], skiprows=13, header=0)
-            time_data = data["TIME"].to_numpy() * 1e3
-            ch2_data = data["CH2"].to_numpy()
-            ch3_data = data["CH3"].to_numpy()
-
-            target_width = max(24, int(self.full_thumbnail_size[0]))
-            target_height = max(24, int(self.full_thumbnail_size[1]))
-            render_dpi = 180
-            fig = Figure(
-                figsize=(target_width / render_dpi, target_height / render_dpi),
-                dpi=render_dpi,
-            )
-            fig.subplots_adjust(left=0.08, right=0.98, top=0.92, bottom=0.16)
-            ax = fig.add_subplot(111)
-            ax.plot(time_data, ch2_data, linewidth=1.25, color="C0")
-            ax.plot(time_data, ch3_data, linewidth=1.25, alpha=0.45, color="C1")
-
-            params = row.get("params")
-            if params:
-                fitted_ch2 = self.model_func(ch3_data, *params)
-                ax.plot(time_data, fitted_ch2, linewidth=1.25, color="C2")
-
-            ax.set_xticks([])
-            ax.set_yticks([])
-            ax.grid(True, alpha=0.15)
-
-            # Render to pixmap via matplotlib PNG export
-            buf = BytesIO()
-            fig.savefig(buf, format="png", dpi=render_dpi)
-            buf.seek(0)
-            data_bytes = buf.getvalue()
-            buf.close()
-
-            pixmap = QPixmap()
-            pixmap.loadFromData(data_bytes, "PNG")
-            return pixmap
-        except Exception:
-            pixmap = QPixmap(self.full_thumbnail_size[0], self.full_thumbnail_size[1])
-            pixmap.fill(Qt.GlobalColor.white)
-            return pixmap
+        return render_batch_thumbnail(
+            row,
+            self.model_func,
+            full_thumbnail_size=self.full_thumbnail_size,
+        )
 
 
 class ManualFitGUI(QMainWindow):
@@ -508,6 +532,12 @@ class ManualFitGUI(QMainWindow):
         self.batch_capture_keys = []
         self.batch_match_count = 0
         self.batch_unmatched_files = []
+        self.analysis_csv_records = []
+        self.analysis_csv_path = None
+        self.analysis_records = []
+        self.analysis_columns = []
+        self.analysis_numeric_data = {}
+        self.analysis_param_columns = []
         self.max_thumbnails = 8
         self.thumb_cols = 1
         self.batch_row_height = 64
@@ -557,8 +587,10 @@ class ManualFitGUI(QMainWindow):
 
         self.manual_tab = QWidget()
         self.batch_tab = QWidget()
+        self.analysis_tab = QWidget()
         self.tabs.addTab(self.manual_tab, "Manual Fit")
         self.tabs.addTab(self.batch_tab, "Batch Fit")
+        self.tabs.addTab(self.analysis_tab, "Batch Analysis")
 
         manual_layout = QVBoxLayout(self.manual_tab)
         manual_layout.setContentsMargins(6, 6, 6, 6)
@@ -585,6 +617,13 @@ class ManualFitGUI(QMainWindow):
         self.create_batch_controls_frame(batch_layout)
         self.create_batch_results_frame(batch_layout)
         self.create_thumbnails_frame(batch_layout)
+
+        analysis_layout = QVBoxLayout(self.analysis_tab)
+        analysis_layout.setContentsMargins(6, 6, 6, 6)
+        analysis_layout.setSpacing(6)
+        self.create_batch_analysis_frame(analysis_layout)
+        analysis_layout.addStretch()
+
         self.preview_close_shortcut = QShortcut(QKeySequence("Escape"), self)
         self.preview_close_shortcut.activated.connect(self._close_preview_panel)
 
@@ -1199,6 +1238,381 @@ class ManualFitGUI(QMainWindow):
         self.batch_table.setAlternatingRowColors(True)
         parent_layout.addWidget(self.batch_table)
 
+    def create_batch_analysis_frame(self, parent_layout):
+        """Create interactive batch analysis plot controls."""
+        group = QGroupBox("")
+        layout = QVBoxLayout()
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(4)
+
+        source_row = QHBoxLayout()
+        source_row.setSpacing(4)
+        source_row.addWidget(QLabel("Analysis Source:"))
+        self.analysis_source_combo = QComboBox()
+        self.analysis_source_combo.addItem("Completed Batch Run", "run")
+        self.analysis_source_combo.addItem("Loaded Batch CSV", "csv")
+        self.analysis_source_combo.currentIndexChanged.connect(
+            self._on_analysis_source_changed
+        )
+        source_row.addWidget(self.analysis_source_combo)
+        self.analysis_load_csv_btn = QPushButton("Load Batch CSV")
+        self.analysis_load_csv_btn.clicked.connect(self.load_batch_analysis_csv)
+        self.analysis_load_csv_btn.setEnabled(False)
+        source_row.addWidget(self.analysis_load_csv_btn)
+        self.analysis_status_label = QLabel("Using completed batch results (0 rows).")
+        self.analysis_status_label.setObjectName("statusLabel")
+        source_row.addWidget(self.analysis_status_label, 1)
+        layout.addLayout(source_row)
+
+        controls_row = QHBoxLayout()
+        controls_row.setSpacing(4)
+        controls_row.addWidget(QLabel("Field (X):"))
+        self.analysis_x_combo = QComboBox()
+        self.analysis_x_combo.currentIndexChanged.connect(self.update_batch_analysis_plot)
+        controls_row.addWidget(self.analysis_x_combo, 2)
+        self.analysis_clear_x_btn = QPushButton("Clear X")
+        self.analysis_clear_x_btn.clicked.connect(self._clear_analysis_x_field)
+        controls_row.addWidget(self.analysis_clear_x_btn)
+        controls_row.addWidget(QLabel("Plot:"))
+        self.analysis_mode_combo = QComboBox()
+        self.analysis_mode_combo.addItem("Combined", "combined")
+        self.analysis_mode_combo.addItem("One per parameter", "separate")
+        self.analysis_mode_combo.currentIndexChanged.connect(
+            self.update_batch_analysis_plot
+        )
+        controls_row.addWidget(self.analysis_mode_combo)
+        self.analysis_fit_line_btn = QPushButton("Best-Fit Lines")
+        self.analysis_fit_line_btn.setCheckable(True)
+        self.analysis_fit_line_btn.setChecked(True)
+        self.analysis_fit_line_btn.toggled.connect(self.update_batch_analysis_plot)
+        controls_row.addWidget(self.analysis_fit_line_btn)
+        self.analysis_refresh_btn = QPushButton("Refresh")
+        self.analysis_refresh_btn.clicked.connect(
+            lambda: self._refresh_batch_analysis_data(preserve_selection=True)
+        )
+        controls_row.addWidget(self.analysis_refresh_btn)
+        layout.addLayout(controls_row)
+
+        params_row = QHBoxLayout()
+        params_row.setSpacing(4)
+        params_row.addWidget(QLabel("Parameters (Y):"))
+        self.analysis_param_buttons = {}
+        self.analysis_params_button_layout = QHBoxLayout()
+        self.analysis_params_button_layout.setSpacing(4)
+        params_row.addLayout(self.analysis_params_button_layout, 1)
+        param_btn_col = QVBoxLayout()
+        param_btn_col.setSpacing(4)
+        select_all_btn = QPushButton("Select All")
+        select_all_btn.clicked.connect(self._select_all_analysis_params)
+        param_btn_col.addWidget(select_all_btn)
+        clear_btn = QPushButton("Clear")
+        clear_btn.clicked.connect(self._clear_analysis_params)
+        param_btn_col.addWidget(clear_btn)
+        param_btn_col.addStretch()
+        params_row.addLayout(param_btn_col)
+        layout.addLayout(params_row)
+
+        self.analysis_fig = Figure(figsize=(10, 3.2), dpi=100)
+        self.analysis_fig.subplots_adjust(left=0.08, right=0.98, top=0.95, bottom=0.2)
+        self.analysis_canvas = FigureCanvas(self.analysis_fig)
+        layout.addWidget(self.analysis_canvas)
+
+        group.setLayout(layout)
+        parent_layout.addWidget(group)
+
+        self._refresh_batch_analysis_data(preserve_selection=False)
+
+    def _on_analysis_source_changed(self):
+        source = self.analysis_source_combo.currentData()
+        self.analysis_load_csv_btn.setEnabled(source == "csv")
+        self._refresh_batch_analysis_data(preserve_selection=True)
+
+    def load_batch_analysis_csv(self):
+        """Load a previously exported batch CSV for analysis."""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Batch CSV",
+            str(Path.cwd()),
+            "CSV Files (*.csv);;All Files (*.*)",
+        )
+        if not file_path:
+            return
+        try:
+            frame = read_csv(file_path, header=0)
+            self.analysis_csv_records = frame.to_dict("records")
+            self.analysis_csv_path = file_path
+            csv_idx = self.analysis_source_combo.findData("csv")
+            if csv_idx >= 0:
+                self.analysis_source_combo.setCurrentIndex(csv_idx)
+            self._refresh_batch_analysis_data(preserve_selection=False)
+            self.stats_text.append(
+                f"✓ Loaded analysis CSV: {Path(file_path).name} ({len(self.analysis_csv_records)} rows)"
+            )
+        except Exception as exc:
+            self.stats_text.append(f"✗ Failed to load analysis CSV: {exc}")
+
+    def _extract_analysis_records_from_batch(self):
+        records = []
+        for row in self.batch_results:
+            record = {"File": Path(row["file"]).name}
+            captures = row.get("captures") or {}
+            for key, value in captures.items():
+                record[key] = value
+            params = row.get("params") or []
+            for idx, spec in enumerate(self.param_specs):
+                record[spec.column_name] = params[idx] if idx < len(params) else None
+            record["R2"] = row.get("r2")
+            record["Error"] = row.get("error") or ""
+            records.append(record)
+        return records
+
+    def _extract_analysis_columns(self, records):
+        columns = []
+        for row in records:
+            for key in row.keys():
+                if key not in columns:
+                    columns.append(key)
+        return columns
+
+    def _coerce_numeric_array(self, values):
+        numeric = []
+        for value in values:
+            if value is None:
+                numeric.append(np.nan)
+                continue
+            text = str(value).strip()
+            if text == "":
+                numeric.append(np.nan)
+                continue
+            try:
+                numeric.append(float(text))
+            except Exception:
+                numeric.append(np.nan)
+        return np.asarray(numeric, dtype=float)
+
+    def _default_analysis_x_field(self, numeric_columns):
+        for key in self.batch_capture_keys:
+            if key in numeric_columns:
+                return key
+        for key in numeric_columns:
+            if key not in self.analysis_param_columns and key != "R2":
+                return key
+        return numeric_columns[0] if numeric_columns else None
+
+    def _refresh_batch_analysis_data(self, preserve_selection):
+        source = self.analysis_source_combo.currentData()
+        if source == "csv":
+            records = list(self.analysis_csv_records)
+            if records:
+                file_name = (
+                    Path(self.analysis_csv_path).name
+                    if self.analysis_csv_path
+                    else "CSV"
+                )
+                self.analysis_status_label.setText(
+                    f"Loaded CSV: {file_name} ({len(records)} rows)."
+                )
+            else:
+                self.analysis_status_label.setText("Loaded CSV: no rows.")
+        else:
+            records = self._extract_analysis_records_from_batch()
+            self.analysis_status_label.setText(
+                f"Using completed batch results ({len(records)} rows)."
+            )
+
+        self.analysis_records = records
+        self.analysis_columns = self._extract_analysis_columns(records)
+        self.analysis_numeric_data = {}
+        for column in self.analysis_columns:
+            values = [row.get(column, "") for row in records]
+            as_numeric = self._coerce_numeric_array(values)
+            if np.isfinite(as_numeric).sum() > 0:
+                self.analysis_numeric_data[column] = as_numeric
+
+        numeric_columns = list(self.analysis_numeric_data.keys())
+        self.analysis_param_columns = [
+            spec.column_name
+            for spec in self.param_specs
+            if spec.column_name in self.analysis_numeric_data
+        ]
+        if not self.analysis_param_columns:
+            self.analysis_param_columns = [
+                key for key in numeric_columns if key not in ("R2",)
+            ]
+
+        previous_x = (
+            self.analysis_x_combo.currentData() if preserve_selection else None
+        )
+        previous_params = (
+            set(self._selected_analysis_params()) if preserve_selection else set()
+        )
+
+        self.analysis_x_combo.blockSignals(True)
+        self.analysis_x_combo.clear()
+        self.analysis_x_combo.addItem("Select X Axis...", None)
+        for key in numeric_columns:
+            self.analysis_x_combo.addItem(key, key)
+        self.analysis_x_combo.blockSignals(False)
+
+        if preserve_selection and previous_x is None:
+            chosen_x = None
+        else:
+            chosen_x = previous_x if previous_x in numeric_columns else None
+            if chosen_x is None:
+                chosen_x = self._default_analysis_x_field(numeric_columns)
+        x_idx = self.analysis_x_combo.findData(chosen_x)
+        if x_idx < 0:
+            x_idx = self.analysis_x_combo.findData(None)
+        if x_idx >= 0:
+            self.analysis_x_combo.setCurrentIndex(x_idx)
+
+        self._rebuild_analysis_param_buttons(previous_params)
+
+        self.update_batch_analysis_plot()
+
+    def _selected_analysis_params(self):
+        return [
+            key
+            for key, button in self.analysis_param_buttons.items()
+            if button.isChecked()
+        ]
+
+    def _rebuild_analysis_param_buttons(self, previous_params):
+        while self.analysis_params_button_layout.count():
+            item = self.analysis_params_button_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        self.analysis_param_buttons = {}
+        for key in self.analysis_param_columns:
+            button = QPushButton(key)
+            button.setCheckable(True)
+            button.setChecked(not previous_params or key in previous_params)
+            button.toggled.connect(self.update_batch_analysis_plot)
+            self.analysis_params_button_layout.addWidget(button)
+            self.analysis_param_buttons[key] = button
+        self.analysis_params_button_layout.addStretch()
+
+    def _select_all_analysis_params(self):
+        for button in self.analysis_param_buttons.values():
+            button.setChecked(True)
+        self.update_batch_analysis_plot()
+
+    def _clear_analysis_params(self):
+        for button in self.analysis_param_buttons.values():
+            button.setChecked(False)
+        self.update_batch_analysis_plot()
+
+    def _clear_analysis_x_field(self):
+        idx = self.analysis_x_combo.findData(None)
+        if idx >= 0:
+            self.analysis_x_combo.setCurrentIndex(idx)
+        self.update_batch_analysis_plot()
+
+    def _show_analysis_message(self, message):
+        self.analysis_fig.clear()
+        ax = self.analysis_fig.add_subplot(111)
+        ax.text(0.5, 0.5, message, ha="center", va="center")
+        ax.set_axis_off()
+        self.analysis_canvas.draw_idle()
+
+    def _linear_fit(self, x_data, y_data):
+        if x_data.size < 2:
+            return None
+        if np.isclose(float(np.ptp(x_data)), 0.0):
+            return None
+        try:
+            slope, intercept = np.polyfit(x_data, y_data, 1)
+            return float(slope), float(intercept)
+        except Exception:
+            return None
+
+    def update_batch_analysis_plot(self):
+        """Plot parameter variation against selected field."""
+        if not hasattr(self, "analysis_fig"):
+            return
+        if not self.analysis_numeric_data:
+            self._show_analysis_message("No numeric data available for analysis.")
+            return
+
+        x_field = self.analysis_x_combo.currentData()
+        selected_params = self._selected_analysis_params()
+        if x_field not in self.analysis_numeric_data:
+            self._show_analysis_message("Select an X field to plot.")
+            return
+        if not selected_params:
+            self._show_analysis_message("Select at least one parameter to plot.")
+            return
+
+        x_values = self.analysis_numeric_data[x_field]
+        mode = self.analysis_mode_combo.currentData()
+        show_fit_lines = self.analysis_fit_line_btn.isChecked()
+
+        self.analysis_fig.clear()
+        if mode == "separate" and len(selected_params) > 1:
+            axes = self.analysis_fig.subplots(len(selected_params), 1, sharex=True)
+            axes = list(np.atleast_1d(axes))
+        else:
+            axes = [self.analysis_fig.add_subplot(111)]
+
+        plotted_any = False
+        for idx, param_name in enumerate(selected_params):
+            y_values = self.analysis_numeric_data.get(param_name)
+            if y_values is None:
+                continue
+            mask = np.isfinite(x_values) & np.isfinite(y_values)
+            if np.count_nonzero(mask) == 0:
+                continue
+
+            plotted_any = True
+            x_plot = x_values[mask]
+            y_plot = y_values[mask]
+            order = np.argsort(x_plot)
+            x_sorted = x_plot[order]
+            y_sorted = y_plot[order]
+            color = f"C{idx % 10}"
+            target_ax = axes[idx] if len(axes) > 1 else axes[0]
+            target_ax.scatter(x_sorted, y_sorted, s=26, color=color, label=param_name)
+
+            if show_fit_lines:
+                fit = self._linear_fit(x_sorted, y_sorted)
+                if fit is not None:
+                    slope, intercept = fit
+                    x_line = np.linspace(float(np.min(x_sorted)), float(np.max(x_sorted)), 200)
+                    y_line = slope * x_line + intercept
+                    fit_label = (
+                        f"{param_name} fit" if len(axes) == 1 else "Best fit"
+                    )
+                    target_ax.plot(
+                        x_line,
+                        y_line,
+                        linestyle="--",
+                        linewidth=1.6,
+                        color=color,
+                        label=fit_label,
+                    )
+
+            if len(axes) > 1:
+                target_ax.set_ylabel(param_name)
+                target_ax.grid(True, alpha=0.25)
+                target_ax.legend(loc="best", fontsize=8)
+
+        if not plotted_any:
+            self._show_analysis_message(
+                "No finite X/Y pairs available for the selected fields."
+            )
+            return
+
+        if len(axes) == 1:
+            axes[0].set_ylabel("Parameter Value")
+            axes[0].legend(loc="best", fontsize=8)
+            axes[0].grid(True, alpha=0.3)
+
+        axes[-1].set_xlabel(x_field)
+        self.analysis_fig.tight_layout()
+        self.analysis_canvas.draw_idle()
+
     def _current_batch_row_height(self):
         return max(
             self.batch_row_height_min,
@@ -1689,6 +2103,7 @@ class ManualFitGUI(QMainWindow):
         current_params = self.get_batch_params()
 
         self.prepare_batch_preview()
+        self._stop_thumbnail_render()
 
         self.batch_thread = QThread(self)
         self.batch_worker = BatchFitWorker(
@@ -1697,6 +2112,7 @@ class ManualFitGUI(QMainWindow):
             self.bounds,
             capture_config.regex_pattern,
             self.model_spec.function,
+            full_thumbnail_size=self._full_batch_thumbnail_size(),
         )
         self.batch_worker.moveToThread(self.batch_thread)
 
@@ -1738,7 +2154,11 @@ class ManualFitGUI(QMainWindow):
             elif existing and existing.get("plot") is not None:
                 row["plot"] = existing["plot"]
         self.update_batch_table()
-        if self.batch_results:
+        self._refresh_batch_analysis_if_run()
+        if self.batch_results and any(
+            row.get("plot_full") is None and row.get("plot") is None
+            for row in self.batch_results
+        ):
             self._stop_thumbnail_render()
             self._start_thumbnail_render()
         self.stats_text.append("✓ Batch fit completed.")
@@ -1833,9 +2253,20 @@ class ManualFitGUI(QMainWindow):
                 param_start + len(self.param_specs) + 1,
                 QTableWidgetItem(error_text),
             )
+            self._apply_batch_row_error_background(row_idx, bool(error_text))
         finally:
             if sorting_enabled:
                 self.batch_table.setSortingEnabled(True)
+
+    def _apply_batch_row_error_background(self, row_idx, is_error):
+        """Tint errored rows pale red; clear tint for non-error rows."""
+        if row_idx < 0 or row_idx >= self.batch_table.rowCount():
+            return
+        color = QColor("#fee2e2") if is_error else QColor()
+        for col_idx in range(self.batch_table.columnCount()):
+            item = self.batch_table.item(row_idx, col_idx)
+            if item is not None:
+                item.setBackground(color)
 
     def _update_batch_plot_cell(self, row_idx, row):
         """Update only the plot thumbnail cell for a batch row."""
@@ -2093,10 +2524,12 @@ class ManualFitGUI(QMainWindow):
             config = self._resolve_batch_capture_config(show_errors=True)
             if config is None:
                 self._close_preview_panel()
+                self._refresh_batch_analysis_if_run()
                 return
             self.batch_status_label.hide()
             self._update_batch_capture_feedback(config)
             self._close_preview_panel()
+            self._refresh_batch_analysis_if_run()
             return
 
         capture_config = self._resolve_batch_capture_config(show_errors=True)
@@ -2173,6 +2606,7 @@ class ManualFitGUI(QMainWindow):
 
         self._update_batch_capture_feedback(capture_config)
         self.update_batch_table()
+        self._refresh_batch_analysis_if_run()
         if self._preview_file_path and not any(
             row["file"] == self._preview_file_path for row in self.batch_results
         ):
@@ -2182,6 +2616,12 @@ class ManualFitGUI(QMainWindow):
             for row in self.batch_results
         ):
             self._start_thumbnail_render()
+
+    def _refresh_batch_analysis_if_run(self):
+        if not hasattr(self, "analysis_source_combo"):
+            return
+        if self.analysis_source_combo.currentData() == "run":
+            self._refresh_batch_analysis_data(preserve_selection=True)
 
     def closeEvent(self, event):
         """Ensure worker thread is stopped before closing."""
