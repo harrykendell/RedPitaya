@@ -10,7 +10,7 @@ import re
 import csv
 from io import BytesIO
 from dataclasses import dataclass
-from typing import Callable, Sequence, Tuple
+from typing import Callable, Dict, Optional, Pattern, Sequence, Tuple
 import numpy as np
 from pathlib import Path
 from sklearn.metrics import r2_score
@@ -37,6 +37,7 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QTabWidget,
     QAbstractSpinBox,
+    QSizePolicy,
 )
 from PyQt6.QtCore import Qt, QTimer, QSize
 from PyQt6.QtCore import QObject, QThread, pyqtSignal, pyqtSlot
@@ -52,7 +53,7 @@ from matplotlib.pyplot import switch_backend
 
 def mi_model(x, a, b, phi, d):
     """MI model: Voltage = |A*sin(B*Sig gen Output + phi_0) + D|^2"""
-    return np.abs(a * np.sin(b * x + np.pi*phi) + d) ** 2
+    return np.abs(a * np.sin(b * x + np.pi * phi) + d) ** 2
 
 
 @dataclass(frozen=True)
@@ -119,8 +120,8 @@ FIT_MODELS = {
     "mi_abs_squared": FitModelSpec(
         key="mi_abs_squared",
         display_name="MI Abs-Squared",
-        formula_latex=r"\left|A\sin(Bx+\pi\times\phi)+D\right|^2",
-        formula_fallback="|A·sin(B·x + φ) + D|²",
+        formula_latex=r"Voltage = \left|A\sin(Bx+\pi\times\phi)+D\right|^2",
+        formula_fallback="Voltage = |A·sin(B·x + φ) + D|²",
         function=mi_model,
         params=(
             ParameterSpec(
@@ -162,6 +163,106 @@ ACTIVE_MODEL = FIT_MODELS["mi_abs_squared"]
 
 # Initialize backend after model definitions.
 switch_backend("Qt5Agg")
+
+
+@dataclass(frozen=True)
+class CapturePatternConfig:
+    mode: str
+    regex_pattern: str
+    regex: Optional[Pattern[str]]
+
+
+_FIELD_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _template_to_regex(template_text: str) -> str:
+    """Convert a simple filename template into a regex with named captures."""
+    if not template_text:
+        raise ValueError("Template is empty.")
+
+    pieces = ["^"]
+    seen_fields = set()
+    idx = 0
+    length = len(template_text)
+
+    while idx < length:
+        char = template_text[idx]
+        if char == "{":
+            end = template_text.find("}", idx + 1)
+            if end < 0:
+                raise ValueError("Missing closing '}' in template.")
+            field_name = template_text[idx + 1 : end].strip()
+            if not _FIELD_NAME_RE.fullmatch(field_name):
+                raise ValueError(
+                    f"Invalid field name '{field_name}'. Use letters, numbers, underscore."
+                )
+            if field_name in seen_fields:
+                raise ValueError(f"Duplicate field name '{field_name}'.")
+            pieces.append(f"(?P<{field_name}>.+?)")
+            seen_fields.add(field_name)
+            idx = end + 1
+            continue
+        if char == "}":
+            raise ValueError("Unexpected '}' in template.")
+        if char == "*":
+            pieces.append(".*")
+            idx += 1
+            continue
+
+        literal_start = idx
+        while idx < length and template_text[idx] not in "{}*":
+            idx += 1
+        pieces.append(re.escape(template_text[literal_start:idx]))
+
+    pieces.append("$")
+    return "".join(pieces)
+
+
+def parse_capture_pattern(pattern_text: str) -> CapturePatternConfig:
+    """Parse capture input as simple template or advanced regex."""
+    text = pattern_text.strip()
+    if not text:
+        return CapturePatternConfig(mode="off", regex_pattern="", regex=None)
+
+    if text.startswith("re:"):
+        regex_pattern = text[3:].strip()
+        if not regex_pattern:
+            raise ValueError("Regex mode requires a pattern after 're:'.")
+        regex = re.compile(regex_pattern)
+        return CapturePatternConfig(
+            mode="regex", regex_pattern=regex_pattern, regex=regex
+        )
+
+    if "(?P<" in text:
+        regex = re.compile(text)
+        return CapturePatternConfig(mode="regex", regex_pattern=text, regex=regex)
+
+    regex_pattern = _template_to_regex(text)
+    regex = re.compile(regex_pattern)
+    return CapturePatternConfig(
+        mode="template", regex_pattern=regex_pattern, regex=regex
+    )
+
+
+def extract_captures(
+    stem: str, regex: Optional[Pattern[str]]
+) -> Optional[Dict[str, str]]:
+    """Extract captures from a filename stem, supporting named and positional groups."""
+    if regex is None:
+        return {}
+    match = regex.search(stem)
+    if not match:
+        return None
+
+    captures = match.groupdict()
+    if captures:
+        return captures
+
+    groups = match.groups()
+    if groups:
+        return {f"group_{idx + 1}": value for idx, value in enumerate(groups)}
+
+    return {"match": match.group(0)}
 
 
 class FitWorker(QObject):
@@ -258,10 +359,9 @@ class BatchFitWorker(QObject):
                     "error": None,
                 }
 
-                if self.regex:
-                    match = self.regex.search(Path(file_path).stem)
-                    if match:
-                        row["captures"] = match.groupdict()
+                captures = extract_captures(Path(file_path).stem, self.regex)
+                if captures:
+                    row["captures"] = captures
 
                 try:
                     data = read_csv(file_path, skiprows=13, header=0)
@@ -304,11 +404,11 @@ class ThumbnailRenderWorker(QObject):
     finished = pyqtSignal()
     cancelled = pyqtSignal()
 
-    def __init__(self, batch_results, model_func, thumbnail_size=(72, 48)):
+    def __init__(self, batch_results, model_func, full_thumbnail_size=(468, 312)):
         super().__init__()
         self.batch_results = batch_results
         self.model_func = model_func
-        self.thumbnail_size = thumbnail_size
+        self.full_thumbnail_size = full_thumbnail_size
         self.cancel_requested = False
 
     def request_cancel(self):
@@ -324,7 +424,7 @@ class ThumbnailRenderWorker(QObject):
                     return
 
                 pixmap = self.render_thumbnail(row)
-                row["plot"] = pixmap
+                row["plot_full"] = pixmap
                 self.progress.emit(idx + 1, total, idx)
 
             if self.cancel_requested:
@@ -343,16 +443,22 @@ class ThumbnailRenderWorker(QObject):
             ch2_data = data["CH2"].to_numpy()
             ch3_data = data["CH3"].to_numpy()
 
-            fig = Figure(figsize=(1.8, 1.0), dpi=80)
+            target_width = max(24, int(self.full_thumbnail_size[0]))
+            target_height = max(24, int(self.full_thumbnail_size[1]))
+            render_dpi = 180
+            fig = Figure(
+                figsize=(target_width / render_dpi, target_height / render_dpi),
+                dpi=render_dpi,
+            )
             fig.subplots_adjust(left=0.08, right=0.98, top=0.92, bottom=0.16)
             ax = fig.add_subplot(111)
-            ax.plot(time_data, ch2_data, linewidth=1, color="C0")
-            ax.plot(time_data, ch3_data, linewidth=1, alpha=0.4, color="C1")
+            ax.plot(time_data, ch2_data, linewidth=1.25, color="C0")
+            ax.plot(time_data, ch3_data, linewidth=1.25, alpha=0.45, color="C1")
 
             params = row.get("params")
             if params:
                 fitted_ch2 = self.model_func(ch3_data, *params)
-                ax.plot(time_data, fitted_ch2, linewidth=1, color="C2")
+                ax.plot(time_data, fitted_ch2, linewidth=1.25, color="C2")
 
             ax.set_xticks([])
             ax.set_yticks([])
@@ -360,18 +466,16 @@ class ThumbnailRenderWorker(QObject):
 
             # Render to pixmap via matplotlib PNG export
             buf = BytesIO()
-            fig.savefig(buf, format="png", dpi=80, bbox_inches="tight")
+            fig.savefig(buf, format="png", dpi=render_dpi)
             buf.seek(0)
             data_bytes = buf.getvalue()
             buf.close()
 
             pixmap = QPixmap()
             pixmap.loadFromData(data_bytes, "PNG")
-            return pixmap.scaledToHeight(
-                self.thumbnail_size[1], Qt.TransformationMode.SmoothTransformation
-            )
+            return pixmap
         except Exception:
-            pixmap = QPixmap(self.thumbnail_size[0], self.thumbnail_size[1])
+            pixmap = QPixmap(self.full_thumbnail_size[0], self.full_thumbnail_size[1])
             pixmap.fill(Qt.GlobalColor.white)
             return pixmap
 
@@ -385,7 +489,7 @@ class ManualFitGUI(QMainWindow):
         self.param_sliders = {}
         self.batch_param_spinboxes = {}
 
-        self.setWindowTitle(f"Manual {self.model_spec.display_name} Curve Fitting")
+        self.setWindowTitle(f"Curve Fitting ({self.model_spec.display_name})")
         self.setGeometry(100, 100, 900, 640)
 
         self.data_files = []
@@ -402,8 +506,16 @@ class ManualFitGUI(QMainWindow):
         self.batch_results = []
         self.batch_files = []
         self.batch_capture_keys = []
+        self.batch_match_count = 0
+        self.batch_unmatched_files = []
         self.max_thumbnails = 8
         self.thumb_cols = 1
+        self.batch_row_height = 64
+        self.batch_row_height_min = 40
+        self.batch_row_height_max = 320
+        self.batch_thumbnail_aspect = 1.5
+        self.batch_thumbnail_supersample = 5.0
+        self._batch_row_height_sync = False
         self.regex_timer = QTimer()
         self.regex_timer.setSingleShot(True)
         self.regex_timer.timeout.connect(self._do_prepare_batch_preview)
@@ -843,9 +955,7 @@ class ManualFitGUI(QMainWindow):
         self.show_residuals_cb = QPushButton("Residuals")
         self.show_residuals_cb.setCheckable(True)
         self.show_residuals_cb.setChecked(True)
-        self.show_residuals_cb.toggled.connect(
-            lambda: self.update_plot(fast=False)
-        )
+        self.show_residuals_cb.toggled.connect(lambda: self.update_plot(fast=False))
         header_layout.addWidget(self.show_residuals_cb)
         reset_btn = QPushButton("Reset")
         reset_btn.clicked.connect(self.reset_params)
@@ -923,6 +1033,29 @@ class ManualFitGUI(QMainWindow):
 
         return (layout, spinbox, slider)
 
+    def create_batch_param_control(self, spec, default_val):
+        """Create batch parameter row with label + spinbox (no slider)."""
+        layout = QHBoxLayout()
+        layout.setSpacing(4)
+
+        layout.addWidget(self._create_param_label(spec, width=130))
+
+        spinbox = QDoubleSpinBox()
+        spinbox.setMinimum(spec.min_value)
+        spinbox.setMaximum(spec.max_value)
+        spinbox.setValue(default_val)
+        spinbox.setSingleStep(spec.inferred_step)
+        spinbox.setDecimals(spec.decimals)
+        spinbox.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+        spinbox.setKeyboardTracking(False)
+        spinbox.setMinimumWidth(80)
+        spinbox.setMaximumWidth(80)
+        spinbox.setToolTip(spec.description)
+        layout.addWidget(spinbox)
+        layout.addStretch()
+
+        return layout, spinbox
+
     def create_stats_frame(self, parent_layout):
         """Create statistics display section with auto-fit controls."""
         group = QGroupBox("")
@@ -961,66 +1094,83 @@ class ManualFitGUI(QMainWindow):
     def create_batch_controls_frame(self, parent_layout):
         """Create batch controls and selected file display."""
         group = QGroupBox("")
+        group.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(4)
 
-        regex_layout = QHBoxLayout()
-        regex_layout.setSpacing(4)
-        regex_layout.addWidget(QLabel("Regex:"))
-        self.regex_input = QLineEdit(r"data_(?P<freq>\d+Hz)_(?P<idx>\d{3})_ALL")
-        self.regex_input.setToolTip("Named groups become table columns")
-        self.regex_input.textChanged.connect(self._on_regex_changed)
-        regex_layout.addWidget(self.regex_input)
-        layout.addLayout(regex_layout)
+        split_layout = QHBoxLayout()
+        split_layout.setSpacing(12)
 
-        params_layout = QHBoxLayout()
+        params_layout = QVBoxLayout()
         params_layout.setSpacing(4)
-        self.batch_param_spinboxes.clear()
-        for idx, spec in enumerate(self.param_specs):
-            params_layout.addWidget(self._create_param_label(spec, width=120))
-            spinbox = QDoubleSpinBox()
-            spinbox.setMinimum(spec.min_value)
-            spinbox.setMaximum(spec.max_value)
-            spinbox.setValue(self.defaults[idx])
-            spinbox.setSingleStep(spec.inferred_step)
-            spinbox.setDecimals(spec.decimals)
-            spinbox.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
-            spinbox.setMaximumWidth(90)
-            spinbox.setToolTip(spec.description)
-            params_layout.addWidget(spinbox)
-            self.batch_param_spinboxes[spec.key] = spinbox
-
         sync_btn = QPushButton("Sync from Manual")
         sync_btn.setToolTip("Copy parameters from Manual Fit tab")
         sync_btn.clicked.connect(self.sync_batch_params_from_manual)
-        params_layout.addWidget(sync_btn)
 
-        self.run_batch_btn = QPushButton("Run Batch")
+        params_header_row = QHBoxLayout()
+        params_header_row.setSpacing(4)
+        params_header_row.addWidget(QLabel("Batch Parameters"))
+        params_header_row.addStretch()
+        params_header_row.addWidget(sync_btn)
+        params_layout.addLayout(params_header_row)
+
+        self.batch_param_spinboxes.clear()
+        for idx, spec in enumerate(self.param_specs):
+            param_row, spinbox = self.create_batch_param_control(
+                spec, self.defaults[idx]
+            )
+            params_layout.addLayout(param_row)
+            self.batch_param_spinboxes[spec.key] = spinbox
+
+        file_layout = QVBoxLayout()
+        file_layout.setSpacing(4)
+
+        self.run_batch_btn_default_text = "Run Batch"
+        self.run_batch_btn = QPushButton(self.run_batch_btn_default_text)
         self.run_batch_btn.clicked.connect(self.run_batch_fit)
 
         export_table_btn = QPushButton("Export CSV")
         export_table_btn.clicked.connect(self.export_batch_table)
 
+        regex_layout = QHBoxLayout()
+        regex_layout.setSpacing(4)
+        regex_layout.addWidget(QLabel("Pattern:"))
+        self.regex_input = QLineEdit("data_{freq}_{idx}_ALL")
+        self.regex_input.setPlaceholderText("Example: data_{freq}_{idx}_ALL")
+        self.regex_input.setToolTip(
+            "Simple mode: use {field} placeholders (and * wildcard).\n"
+            "Advanced regex: prefix with re: or use (?P<name>...) groups."
+        )
+        self.regex_input.textChanged.connect(self._on_regex_changed)
+        regex_layout.addWidget(self.regex_input)
+        file_layout.addLayout(regex_layout)
+
+        self.batch_parse_feedback_label = QLabel(
+            "Use {field} placeholders to extract columns."
+        )
+        self.batch_parse_feedback_label.setObjectName("statusLabel")
+        file_layout.addWidget(self.batch_parse_feedback_label)
+
+        self.select_batch_btn = QPushButton("")
+        self.select_batch_btn.clicked.connect(self.select_batch_files)
+        self.update_batch_file_list()
+        file_layout.addWidget(self.select_batch_btn)
+
+        actions_row = QHBoxLayout()
+        actions_row.setSpacing(4)
+        actions_row.addWidget(self.run_batch_btn)
+        actions_row.addWidget(export_table_btn)
+        file_layout.addLayout(actions_row)
+
         self.batch_status_label = QLabel("")
         self.batch_status_label.setObjectName("statusLabel")
         self.batch_status_label.hide()
-        params_layout.addWidget(self.batch_status_label)
-        params_layout.addStretch()
-        layout.addLayout(params_layout)
+        file_layout.addWidget(self.batch_status_label)
 
-        files_layout = QHBoxLayout()
-        files_layout.setSpacing(4)
-        self.batch_files_label = QLabel("Selected Files:")
-        files_layout.addWidget(self.batch_files_label, 1)
-        self.batch_count_label = QLabel("0 files")
-        files_layout.addWidget(self.batch_count_label)
-        select_batch_btn = QPushButton("Select Files")
-        select_batch_btn.clicked.connect(self.select_batch_files)
-        files_layout.addWidget(select_batch_btn)
-        files_layout.addWidget(self.run_batch_btn)
-        files_layout.addWidget(export_table_btn)
-        layout.addLayout(files_layout)
+        split_layout.addLayout(params_layout, 3)
+        split_layout.addLayout(file_layout, 2)
+        layout.addLayout(split_layout)
 
         group.setLayout(layout)
         parent_layout.addWidget(group)
@@ -1031,14 +1181,96 @@ class ManualFitGUI(QMainWindow):
         self.batch_table.setColumnCount(0)
         self.batch_table.setRowCount(0)
         self.batch_table.cellClicked.connect(self._on_batch_table_cell_clicked)
-        self.batch_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
-        self.batch_table.verticalHeader().setVisible(False)
-        # Apply a uniform row height for thumbnail previews.
-        self.batch_table.verticalHeader().setDefaultSectionSize(64)
+        batch_header = self.batch_table.horizontalHeader()
+        batch_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        batch_header.setStretchLastSection(True)
+        batch_header.setMinimumSectionSize(60)
+        v_header = self.batch_table.verticalHeader()
+        v_header.setVisible(True)
+        v_header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        v_header.setMinimumSectionSize(self.batch_row_height_min)
+        v_header.setToolTip("Drag row borders to resize all rows")
+        v_header.sectionResized.connect(self._on_batch_row_resized_by_user)
+        # Apply a uniform row height for plot previews.
+        v_header.setDefaultSectionSize(self._current_batch_row_height())
+        self.batch_table.setSortingEnabled(True)
+        batch_header.setSortIndicatorShown(True)
+        batch_header.setSectionsClickable(True)
         self.batch_table.setAlternatingRowColors(True)
         parent_layout.addWidget(self.batch_table)
+
+    def _current_batch_row_height(self):
+        return max(
+            self.batch_row_height_min,
+            min(self.batch_row_height_max, int(self.batch_row_height)),
+        )
+
+    def _current_batch_thumbnail_size(self):
+        row_height = self._current_batch_row_height()
+        thumb_height = max(24, row_height - 8)
+        thumb_width = max(36, int(round(thumb_height * self.batch_thumbnail_aspect)))
+        return (thumb_width, thumb_height)
+
+    def _full_batch_thumbnail_size(self):
+        full_height = max(
+            24,
+            int(round((self.batch_row_height_max - 8) * self.batch_thumbnail_supersample)),
+        )
+        full_width = max(36, int(round(full_height * self.batch_thumbnail_aspect)))
+        return (full_width, full_height)
+
+    def _apply_batch_row_heights(self):
+        if not hasattr(self, "batch_table"):
+            return
+        if self._batch_row_height_sync:
+            return
+
+        row_height = self._current_batch_row_height()
+        self._batch_row_height_sync = True
+        try:
+            self.batch_table.verticalHeader().setDefaultSectionSize(row_height)
+            if self.batch_table.columnCount() > 0:
+                thumb_width, _ = self._current_batch_thumbnail_size()
+                self.batch_table.setColumnWidth(0, thumb_width + 18)
+            for row_idx in range(self.batch_table.rowCount()):
+                self.batch_table.setRowHeight(row_idx, row_height)
+        finally:
+            self._batch_row_height_sync = False
+
+    def _scaled_batch_plot(self, row):
+        source = row.get("plot_full") or row.get("plot")
+        if source is None:
+            return None
+        target_width, target_height = self._current_batch_thumbnail_size()
+        return source.scaled(
+            target_width,
+            target_height,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+
+    def _find_table_row_by_file(self, file_path):
+        """Find table row index by file path stored in item user data."""
+        if self.batch_table.columnCount() == 0:
+            return None
+        for row_idx in range(self.batch_table.rowCount()):
+            item = self.batch_table.item(row_idx, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == file_path:
+                return row_idx
+        return None
+
+    def _on_batch_row_resized_by_user(self, _logical_index, _old_size, new_size):
+        if self._batch_row_height_sync:
+            return
+        self.batch_row_height = max(
+            self.batch_row_height_min,
+            min(self.batch_row_height_max, int(new_size)),
+        )
+        self._apply_batch_row_heights()
+        for row in self.batch_results:
+            row_idx = self._find_table_row_by_file(row["file"])
+            if row_idx is not None:
+                self._update_batch_plot_cell(row_idx, row)
 
     def create_thumbnails_frame(self, parent_layout):
         """Create click-to-open preview panel for selected batch row."""
@@ -1127,7 +1359,9 @@ class ManualFitGUI(QMainWindow):
 
     def get_batch_params(self):
         """Get batch fit initial parameters."""
-        return [self.batch_param_spinboxes[spec.key].value() for spec in self.param_specs]
+        return [
+            self.batch_param_spinboxes[spec.key].value() for spec in self.param_specs
+        ]
 
     def sync_batch_params_from_manual(self):
         """Copy parameters from manual tab to batch tab."""
@@ -1263,6 +1497,7 @@ class ManualFitGUI(QMainWindow):
         self.batch_thread = None
         self.batch_worker = None
         self.run_batch_btn.setEnabled(True)
+        self.run_batch_btn.setText(self.run_batch_btn_default_text)
         self.batch_status_label.hide()
 
     def update_plot(self, fast=False):
@@ -1413,9 +1648,7 @@ class ManualFitGUI(QMainWindow):
                 f.write(f"Model: {self.model_spec.display_name}\n")
                 f.write(f"Formula: {self.model_spec.formula_fallback}\n")
                 for idx, spec in enumerate(self.param_specs):
-                    f.write(
-                        f"{spec.symbol} ({spec.description}): {params[idx]:.6f}\n"
-                    )
+                    f.write(f"{spec.symbol} ({spec.description}): {params[idx]:.6f}\n")
 
                 if self.current_data is not None:
                     fitted_ch2 = self.evaluate_model(self.current_data["CH3"], params)
@@ -1436,9 +1669,9 @@ class ManualFitGUI(QMainWindow):
         if not file_paths:
             return
         self.batch_files = file_paths
-        self.batch_count_label.setText(f"{len(self.batch_files)} files")
         self.update_batch_file_list()
         self.prepare_batch_preview()
+        self._expand_file_column_for_selected_files()
 
     def run_batch_fit(self):
         """Run batch fitting on selected files."""
@@ -1449,14 +1682,10 @@ class ManualFitGUI(QMainWindow):
             self.stats_text.append("Batch fit is already running.")
             return
 
-        regex_pattern = self.regex_input.text().strip()
-        if regex_pattern:
-            try:
-                re.compile(regex_pattern)
-            except re.error as exc:
-                self.batch_status_label.setText(f"Regex error: {exc}")
-                self.batch_status_label.show()
-                return
+        capture_config = self._resolve_batch_capture_config(show_errors=True)
+        if capture_config is None:
+            return
+
         current_params = self.get_batch_params()
 
         self.prepare_batch_preview()
@@ -1466,7 +1695,7 @@ class ManualFitGUI(QMainWindow):
             self.batch_files,
             current_params,
             self.bounds,
-            regex_pattern,
+            capture_config.regex_pattern,
             self.model_spec.function,
         )
         self.batch_worker.moveToThread(self.batch_thread)
@@ -1478,20 +1707,25 @@ class ManualFitGUI(QMainWindow):
         self.batch_worker.cancelled.connect(self.on_batch_cancelled)
 
         self.run_batch_btn.setEnabled(False)
-        self.batch_status_label.setText("⏳ Batch fit in progress...")
-        self.batch_status_label.show()
+        total = len(self.batch_files)
+        self.run_batch_btn.setText(f"Run Batch (0/{total})")
+        self.batch_status_label.hide()
         self.batch_thread.start()
 
     def on_batch_progress(self, idx, total, row):
         """Update progress label while batch is running."""
-        self.batch_status_label.setText(f"⏳ Batch fit {idx}/{total}")
+        self.run_batch_btn.setText(f"Run Batch ({idx}/{total})")
         row_index = idx - 1
         if row_index < len(self.batch_results):
             existing = self.batch_results[row_index]
-            if existing.get("thumbnail") is not None and row.get("plot") is None:
-                row["plot"] = existing["thumbnail"]
+            if existing.get("plot_full") is not None and row.get("plot_full") is None:
+                row["plot_full"] = existing["plot_full"]
+            elif existing.get("plot") is not None and row.get("plot") is None:
+                row["plot"] = existing["plot"]
             self.batch_results[row_index] = row
-            self.update_batch_table_row(row_index, row)
+            table_row_idx = self._find_table_row_by_file(row["file"])
+            if table_row_idx is not None:
+                self.update_batch_table_row(table_row_idx, row)
 
     def on_batch_finished(self, results):
         """Populate table and thumbnails after batch fit finishes."""
@@ -1499,10 +1733,13 @@ class ManualFitGUI(QMainWindow):
         self.batch_results = list(results)
         for row in self.batch_results:
             existing = previous_by_file.get(row["file"])
-            if existing and existing.get("thumbnail") is not None:
-                row["plot"] = existing["thumbnail"]
+            if existing and existing.get("plot_full") is not None:
+                row["plot_full"] = existing["plot_full"]
+            elif existing and existing.get("plot") is not None:
+                row["plot"] = existing["plot"]
         self.update_batch_table()
-        if any(row.get("plot") is None for row in self.batch_results):
+        if self.batch_results:
+            self._stop_thumbnail_render()
             self._start_thumbnail_render()
         self.stats_text.append("✓ Batch fit completed.")
         self.cleanup_batch_thread()
@@ -1522,79 +1759,129 @@ class ManualFitGUI(QMainWindow):
             self.batch_table.setColumnCount(0)
             return
 
-        columns = (
-            ["Thumbnail"]
-            + ["File"]
-            + self.batch_capture_keys
-            + [spec.column_name for spec in self.param_specs]
-            + ["R2", "Error"]
-        )
-        self.batch_table.setColumnCount(len(columns))
-        self.batch_table.setHorizontalHeaderLabels(columns)
-        self.batch_table.setRowCount(len(self.batch_results))
+        sorting_enabled = self.batch_table.isSortingEnabled()
+        if sorting_enabled:
+            self.batch_table.setSortingEnabled(False)
+        try:
+            columns = (
+                ["Plot"]
+                + ["File"]
+                + self.batch_capture_keys
+                + [spec.column_name for spec in self.param_specs]
+                + ["R2", "Error"]
+            )
+            self.batch_table.setColumnCount(len(columns))
+            self.batch_table.setHorizontalHeaderLabels(columns)
+            self.batch_table.setRowCount(len(self.batch_results))
+            self._apply_batch_row_heights()
 
-        for row_idx, row in enumerate(self.batch_results):
-            self.update_batch_table_row(row_idx, row)
+            for row_idx, row in enumerate(self.batch_results):
+                self.update_batch_table_row(row_idx, row, suspend_sorting=False)
+        finally:
+            if sorting_enabled:
+                self.batch_table.setSortingEnabled(True)
 
-    def update_batch_table_row(self, row_idx, row):
+    def update_batch_table_row(self, row_idx, row, suspend_sorting=True):
         """Update a single batch row in the results table."""
-        # Thumbnail column (index 0) - add icon if available
+        sorting_enabled = suspend_sorting and self.batch_table.isSortingEnabled()
+        if sorting_enabled:
+            self.batch_table.setSortingEnabled(False)
+        try:
+            # Plot column (index 0)
+            self._update_batch_plot_cell(row_idx, row)
+
+            # File name column (index 1)
+            file_name = Path(row["file"]).name
+            file_item = QTableWidgetItem(file_name)
+            file_item.setData(Qt.ItemDataRole.UserRole, row["file"])
+            self.batch_table.setItem(row_idx, 1, file_item)
+
+            # Capture columns (start at index 2)
+            for col_idx, key in enumerate(self.batch_capture_keys, start=2):
+                value = row.get("captures", {}).get(key, "")
+                self.batch_table.setItem(row_idx, col_idx, QTableWidgetItem(str(value)))
+
+            # Parameter columns (start at 2 + len(batch_capture_keys))
+            param_start = 2 + len(self.batch_capture_keys)
+            params = row.get("params")
+            for offset in range(len(self.param_specs)):
+                if params and offset < len(params):
+                    cell_text = f"{params[offset]:.6f}"
+                else:
+                    cell_text = ""
+                self.batch_table.setItem(
+                    row_idx,
+                    param_start + offset,
+                    QTableWidgetItem(cell_text),
+                )
+            r2_val = row.get("r2")
+            if r2_val is not None:
+                self.batch_table.setItem(
+                    row_idx,
+                    param_start + len(self.param_specs),
+                    QTableWidgetItem(f"{r2_val:.6f}"),
+                )
+            else:
+                self.batch_table.setItem(
+                    row_idx,
+                    param_start + len(self.param_specs),
+                    QTableWidgetItem(""),
+                )
+            error_text = row.get("error") or ""
+            self.batch_table.setItem(
+                row_idx,
+                param_start + len(self.param_specs) + 1,
+                QTableWidgetItem(error_text),
+            )
+        finally:
+            if sorting_enabled:
+                self.batch_table.setSortingEnabled(True)
+
+    def _update_batch_plot_cell(self, row_idx, row):
+        """Update only the plot thumbnail cell for a batch row."""
         thumb_item = QTableWidgetItem()
-        pixmap = row.get("plot")
-        if pixmap:
+        pixmap = self._scaled_batch_plot(row)
+        if pixmap is not None:
             thumb_item.setData(Qt.ItemDataRole.DecorationRole, pixmap)
+        else:
+            thumb_item.setData(Qt.ItemDataRole.DecorationRole, None)
         thumb_item.setData(Qt.ItemDataRole.UserRole, row["file"])  # Store file path
         self.batch_table.setItem(row_idx, 0, thumb_item)
 
-        # File name column (index 1)
-        file_name = Path(row["file"]).name
-        self.batch_table.setItem(row_idx, 1, QTableWidgetItem(file_name))
-
-        # Capture columns (start at index 2)
-        for col_idx, key in enumerate(self.batch_capture_keys, start=2):
-            value = row.get("captures", {}).get(key, "")
-            self.batch_table.setItem(row_idx, col_idx, QTableWidgetItem(str(value)))
-
-        # Parameter columns (start at 2 + len(batch_capture_keys))
-        param_start = 2 + len(self.batch_capture_keys)
-        params = row.get("params")
-        for offset in range(len(self.param_specs)):
-            if params and offset < len(params):
-                cell_text = f"{params[offset]:.6f}"
-            else:
-                cell_text = ""
-            self.batch_table.setItem(
-                row_idx,
-                param_start + offset,
-                QTableWidgetItem(cell_text),
-            )
-        r2_val = row.get("r2")
-        if r2_val is not None:
-            self.batch_table.setItem(
-                row_idx,
-                param_start + len(self.param_specs),
-                QTableWidgetItem(f"{r2_val:.6f}"),
-            )
-        else:
-            self.batch_table.setItem(
-                row_idx,
-                param_start + len(self.param_specs),
-                QTableWidgetItem(""),
-            )
-        error_text = row.get("error") or ""
-        self.batch_table.setItem(
-            row_idx,
-            param_start + len(self.param_specs) + 1,
-            QTableWidgetItem(error_text),
-        )
-
     def _on_batch_table_cell_clicked(self, row_idx, col_idx):
         """Open selected row in the preview panel on click."""
-        if col_idx not in (0, 1):
+        if col_idx != 0:
             return
         if row_idx < 0 or row_idx >= len(self.batch_results):
             return
-        self._open_preview_panel(self.batch_results[row_idx])
+        clicked_item = self.batch_table.item(row_idx, col_idx)
+        file_path = clicked_item.data(Qt.ItemDataRole.UserRole) if clicked_item else None
+        if not file_path:
+            file_item = self.batch_table.item(row_idx, 0)
+            file_path = file_item.data(Qt.ItemDataRole.UserRole) if file_item else None
+        if not file_path:
+            return
+        row = next((entry for entry in self.batch_results if entry["file"] == file_path), None)
+        if row is None:
+            return
+        self._open_preview_panel(row)
+
+    def _expand_file_column_for_selected_files(self):
+        """Expand file column width to show the longest selected file name."""
+        if not self.batch_files or self.batch_table.columnCount() < 2:
+            return
+
+        font_metrics = self.batch_table.fontMetrics()
+        longest_width = 0
+        for file_path in self.batch_files:
+            file_name = Path(file_path).name
+            longest_width = max(longest_width, font_metrics.horizontalAdvance(file_name))
+
+        # Account for text padding and small header/sort margin.
+        target_width = longest_width + 36
+        current_width = self.batch_table.columnWidth(1)
+        if target_width > current_width:
+            self.batch_table.setColumnWidth(1, target_width)
 
     def _close_preview_panel(self):
         """Hide preview panel."""
@@ -1665,6 +1952,7 @@ class ManualFitGUI(QMainWindow):
         self.thumb_worker = ThumbnailRenderWorker(
             self.batch_results,
             self.model_spec.function,
+            full_thumbnail_size=self._full_batch_thumbnail_size(),
         )
         self.thumb_worker.moveToThread(self.thumb_thread)
 
@@ -1689,7 +1977,9 @@ class ManualFitGUI(QMainWindow):
         """Update table cell when thumbnail is rendered."""
         if row_idx < len(self.batch_results):
             row = self.batch_results[row_idx]
-            self.update_batch_table_row(row_idx, row)
+            table_row_idx = self._find_table_row_by_file(row["file"])
+            if table_row_idx is not None:
+                self.update_batch_table_row(table_row_idx, row)
 
     def _on_thumbnails_finished(self):
         """Clean up thumbnail worker when finished."""
@@ -1748,20 +2038,45 @@ class ManualFitGUI(QMainWindow):
             self.stats_text.append(f"✗ Export failed: {exc}")
 
     def update_batch_file_list(self):
-        """Refresh selected file list display."""
-        if not self.batch_files:
-            self.batch_files_label.setText("Selected Files: ")
-        else:
-            first_name = Path(self.batch_files[0]).name
-            count_str = (
-                f" +{len(self.batch_files) - 1} more"
-                if len(self.batch_files) > 1
-                else ""
+        """Refresh select button label with selected file count."""
+        count = len(self.batch_files)
+        self.select_batch_btn.setText(f"Select Files ({count} files)")
+
+    def _set_batch_parse_feedback(self, message, is_error=False, tooltip=""):
+        self.batch_parse_feedback_label.setText(message)
+        self.batch_parse_feedback_label.setToolTip(tooltip)
+        if is_error:
+            self.batch_parse_feedback_label.setStyleSheet(
+                "color: #b91c1c; font-weight: 600; padding: 1px 2px;"
             )
-            self.batch_files_label.setText(f"Selected Files: {first_name}{count_str}")
+        else:
+            self.batch_parse_feedback_label.setStyleSheet("")
+
+    def _resolve_batch_capture_config(self, show_errors):
+        pattern_text = self.regex_input.text().strip()
+        try:
+            return parse_capture_pattern(pattern_text)
+        except Exception as exc:
+            if show_errors:
+                self._set_batch_parse_feedback(f"Error: {exc}", is_error=True)
+                self.batch_status_label.setText(f"Error: {exc}")
+                self.batch_status_label.show()
+            return None
+
+    def _update_batch_capture_feedback(self, config):
+        if config.mode == "off":
+            self._set_batch_parse_feedback(
+                "Add {field} placeholders to extract filename columns."
+            )
+            return
+
+        field_text = (
+            ", ".join(self.batch_capture_keys) if self.batch_capture_keys else "none"
+        )
+        self._set_batch_parse_feedback(f"Fields: {field_text}")
 
     def _on_regex_changed(self):
-        """Debounce regex changes to avoid excessive updates."""
+        """Debounce filename pattern changes to avoid excessive updates."""
         self.regex_timer.stop()
         self.regex_timer.start(300)  # 300ms debounce
 
@@ -1773,58 +2088,99 @@ class ManualFitGUI(QMainWindow):
     def _do_prepare_batch_preview(self):
         """Actually perform the batch preview update."""
         if not self.batch_files:
+            self.batch_match_count = 0
+            self.batch_unmatched_files = []
+            config = self._resolve_batch_capture_config(show_errors=True)
+            if config is None:
+                self._close_preview_panel()
+                return
+            self.batch_status_label.hide()
+            self._update_batch_capture_feedback(config)
             self._close_preview_panel()
             return
 
-        regex_pattern = self.regex_input.text().strip()
-        if regex_pattern:
-            try:
-                regex = re.compile(regex_pattern)
-            except re.error as exc:
-                self.batch_status_label.setText(f"Regex error: {exc}")
-                self.batch_status_label.show()
-                return
-        else:
-            regex = None
+        capture_config = self._resolve_batch_capture_config(show_errors=True)
+        if capture_config is None:
+            return
 
         self.batch_status_label.hide()
 
-        self._stop_thumbnail_render()
+        existing_file_order = [row["file"] for row in self.batch_results]
+        files_unchanged = existing_file_order == self.batch_files and bool(
+            self.batch_results
+        )
 
-        # Build a map of existing results by file path to preserve params/r2/error
-        existing_results = {row["file"]: row for row in self.batch_results}
-
-        self.batch_results = []
         self.batch_capture_keys = []
-        for file_path in self.batch_files:
-            captures = {}
-            if regex:
-                match = regex.search(Path(file_path).stem)
-                if match:
-                    captures = match.groupdict()
+        self.batch_match_count = 0
+        self.batch_unmatched_files = []
+
+        if files_unchanged:
+            for row in self.batch_results:
+                extracted = extract_captures(
+                    Path(row["file"]).stem, capture_config.regex
+                )
+                captures = {}
+                if extracted is None:
+                    self.batch_unmatched_files.append(Path(row["file"]).name)
+                else:
+                    captures = extracted
+                    if capture_config.mode != "off":
+                        self.batch_match_count += 1
+                    for key in captures.keys():
+                        if key not in self.batch_capture_keys:
+                            self.batch_capture_keys.append(key)
+                row["captures"] = captures
+        else:
+            self._stop_thumbnail_render()
+
+            # Build a map of existing results by file path to preserve params/r2/error/plot.
+            existing_results = {row["file"]: row for row in self.batch_results}
+            rebuilt_results = []
+
+            for file_path in self.batch_files:
+                captures = {}
+                extracted = extract_captures(Path(file_path).stem, capture_config.regex)
+                if extracted is None:
+                    self.batch_unmatched_files.append(Path(file_path).name)
+                else:
+                    captures = extracted
+                    if capture_config.mode != "off":
+                        self.batch_match_count += 1
                     for key in captures.keys():
                         if key not in self.batch_capture_keys:
                             self.batch_capture_keys.append(key)
 
-            # Preserve existing params/r2/error if file was already processed
-            existing = existing_results.get(file_path)
-            self.batch_results.append(
-                {
-                    "file": file_path,
-                    "captures": captures,
-                    "params": existing["params"] if existing else None,
-                    "r2": existing["r2"] if existing else None,
-                    "error": existing["error"] if existing else None,
-                    "thumbnail": existing["thumbnail"] if existing else None,
-                }
-            )
+                existing = existing_results.get(file_path)
+                existing_plot_full = None
+                if existing:
+                    existing_plot_full = (
+                        existing.get("plot_full")
+                        or existing.get("plot")
+                        or existing.get("thumbnail")
+                    )
+                rebuilt_results.append(
+                    {
+                        "file": file_path,
+                        "captures": captures,
+                        "params": existing["params"] if existing else None,
+                        "r2": existing["r2"] if existing else None,
+                        "error": existing["error"] if existing else None,
+                        "plot_full": existing_plot_full,
+                    }
+                )
 
+            self.batch_results = rebuilt_results
+
+        self._update_batch_capture_feedback(capture_config)
         self.update_batch_table()
         if self._preview_file_path and not any(
             row["file"] == self._preview_file_path for row in self.batch_results
         ):
             self._close_preview_panel()
-        if any(row.get("plot") is None for row in self.batch_results):
+        if any(
+            row.get("plot_full") is None and row.get("plot") is None
+            for row in self.batch_results
+        ):
             self._start_thumbnail_render()
 
     def closeEvent(self, event):
